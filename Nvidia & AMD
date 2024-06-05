@@ -1,0 +1,143 @@
+import praw 
+import pandas as pd
+from praw.models import MoreComments
+from nltk.corpus import stopwords
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem import WordNetLemmatizer
+from nltk.stem import PorterStemmer
+from nltk import FreqDist
+import datetime as dt
+import re # Remove urls
+import emoji
+import spacy
+from spacymoji import Emoji
+import en_core_web_sm
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import custom_lexicon
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pickle
+
+reddit = praw.Reddit(
+    client_id="input your client id",
+    client_secret="input your client secret",
+    user_agent="input your user agent ",
+
+# Submissions in r/AMD_Stock (the subreddit for the AMD stock)'
+subreddit = reddit.subreddit("AMD_Stock ")
+# I want daily submissions
+def get_date(date):
+    return dt.datetime.fromtimestamp(date)
+
+results = []  # Initialize an empty list to store Reddit submission IDs
+
+# Specify the desired limit
+desired_limit = 1000
+
+# Keep track of the number of submissions collected
+submissions_collected = 0
+
+# Iterate over the submissions in the subreddit
+for submission in subreddit.new(limit=None):
+    results.append(submission.id)  # Append each submission ID to the results list
+    submissions_collected += 1
+
+    if submissions_collected >= desired_limit:
+        break  # Stop collecting submissions once the desired limit is reached
+
+print(len(results))
+
+# I want to stock all the IDs of submissions that i collected and also all the comments i will grab from these submissions
+posts = {}
+Comments_All = {}
+
+for post_id in results:
+    post = reddit.submission(id=post_id)
+    posts[post_id] = post
+
+    post.comments.replace_more(limit=None)
+    comments_for_post = []
+    for comment in post.comments:
+        comments_for_post.append(comment.body)
+    Comments_All[post_id] = comments_for_post
+
+# Loop over each submission ID in the results list
+for submission_id in results:
+    # Retrieve the corresponding post from the Reddit API
+    post = reddit.submission(id=submission_id)
+
+    # Retrieve the comments for the post and store them in a list
+    comments_for_post = []
+    post.comments.replace_more(limit=None)
+    for comment in post.comments:
+        comments_for_post.append(comment.body)
+
+    # Convert comments to a string
+    comments_string = ' , '.join(comments_for_post)
+
+    # Perform tokenization, lowercasing, stop word removal, this work is to make it easier for the VADER package to perform a sentiment analysis
+    tokenizer = RegexpTokenizer('\w+|\$[\d\.]+|http\S+')
+    tokenized_string = tokenizer.tokenize(comments_string)
+    lc_tokenized_string = [word.lower() for word in tokenized_string]
+    spacy_nlp = en_core_web_sm.load()
+    all_sw = spacy_nlp.Defaults.stop_words
+    tokens_wosm = [word for word in lc_tokenized_string if not word in all_sw]
+
+    # Save the cleaned comments to a separate pickle file
+    filename = f"{submission_id}.pkl"
+    with open(filename, 'wb') as fp:
+        pickle.dump(tokens_wosm, fp)
+
+# List to store the results for each submission ID
+all_results = []
+
+# Iterate over the submission IDs
+for submission_id in results:
+    # Retrieve the corresponding post from the Reddit API
+    post = reddit.submission(id=submission_id)
+
+    # Get the date of the submission
+    submission_date = dt.datetime.fromtimestamp(post.created_utc)
+
+    # Load the cleaned comments for the current submission ID
+    filename = f"{submission_id}.pkl"
+    cleaned_comments = pd.read_pickle(filename)
+
+    # Perform sentiment analysis for each comment
+    new_words = custom_lexicon.wsbfinancial_jargon
+    SIA = SentimentIntensityAnalyzer()
+    SIA.lexicon.update(new_words)
+    comment_results = []
+    for comment in cleaned_comments:
+        pol_score = SIA.polarity_scores(comment)
+        if 'compound' not in pol_score:
+            continue
+        pol_score['words'] = comment
+        comment_results.append(pol_score)
+
+    # Create a DataFrame for the results of the current submission ID
+    if len(comment_results) == 0:
+        continue
+    df = pd.DataFrame.from_records(comment_results)
+    df['sent_label'] = pd.Series([0] * len(df), index=df.index)
+    df.loc[df['compound'] >= 0.05, 'sent_label'] = 1
+    df.loc[df['compound'] <= -0.05, 'sent_label'] = -1
+
+    # Append the value counts and submission date to the list of all results
+    all_results.append((submission_date, df['sent_label'].value_counts()))
+
+# Get the maximum number of sentiment labels
+max_labels = max(len(vc) for _, vc in all_results)
+
+# Create a DataFrame to store the value counts for each sentiment label
+df_counts = pd.DataFrame(columns=['Date'] + list(range(-1, 2)))
+
+# Iterate over the results and store the value counts in the DataFrame
+for submission_date, value_counts in all_results:
+    normalized_counts = (value_counts / value_counts.sum()) * 100  # Normalize the value counts
+    row_data = [submission_date] + normalized_counts.reindex(range(-1, 2), fill_value=0).tolist()
+    df_counts.loc[len(df_counts)] = row_data
+
+# Save the DataFrame to a CSV file
+df_counts.to_csv('sentiment_countsnew.csv', index=False)
